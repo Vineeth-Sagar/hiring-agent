@@ -305,6 +305,7 @@ class OpenAICompatibleProvider:
         options: Dict[str, Any] = None,
         **kwargs
     ) -> Dict[str, Any]:
+        import os
         import requests
         import time
         import random
@@ -335,14 +336,21 @@ class OpenAICompatibleProvider:
 
         url = f"{self.base_url}/chat/completions"
 
-        MAX_RETRIES = 5
-        BASE_DELAY = 10.0  # seconds — base for exponential backoff
-        MAX_DELAY = 120.0  # cap so we never wait more than 2 minutes
+        # Defaults suit a long-lived CLI run. On a serverless host with a hard
+        # request budget (e.g. Vercel's 60s), set LLM_MAX_RETRIES / the delay
+        # vars lower so a rate-limited call fails fast with a real error instead
+        # of being killed mid-backoff.
+        MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "5"))
+        BASE_DELAY = float(os.getenv("LLM_RETRY_BASE_DELAY", "10"))
+        MAX_DELAY = float(os.getenv("LLM_RETRY_MAX_DELAY", "120"))
+        REQUEST_TIMEOUT = float(os.getenv("LLM_REQUEST_TIMEOUT", "300"))
         # Transient server errors worth retrying with backoff. Unlike 429 these
         # rarely carry a Retry-After header, so we always use exponential backoff.
         RETRYABLE_SERVER_ERRORS = {500, 502, 503, 504}
         for attempt in range(MAX_RETRIES):
-            response = requests.post(url, json=body, headers=headers, timeout=300)
+            response = requests.post(
+                url, json=body, headers=headers, timeout=REQUEST_TIMEOUT
+            )
 
             if response.status_code == 429 and attempt < MAX_RETRIES - 1:
                 retry_after = response.headers.get("Retry-After")

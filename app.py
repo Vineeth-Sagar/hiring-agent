@@ -5,11 +5,12 @@ zero-config Python/FastAPI detection routes every request here (no vercel.json
 rewrites needed).
 
     GET  /        -> HTML single-page app (upload a resume, see the score)
-    GET  /health  -> {"status": "ok"}
+    GET  /health  -> liveness + resolved model / LLM-config check
     GET  /roles   -> {"roles": [...], "default": "..."}
     POST /score   -> multipart form (resume=<pdf>, role=<name>) -> evaluation JSON
 """
 
+import logging
 import os
 import sys
 import tempfile
@@ -22,6 +23,13 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 # project module is imported. Real dashboard env vars still win (setdefault).
 os.environ.setdefault("DEVELOPMENT_MODE", "false")
 os.environ.setdefault("ENABLE_GITHUB_ENRICHMENT", "false")
+# Serverless has a hard request budget (Vercel: 60s). Fail fast on rate limits
+# rather than getting killed mid-backoff. Override in the dashboard if needed.
+os.environ.setdefault("LLM_MAX_RETRIES", "2")
+os.environ.setdefault("LLM_RETRY_BASE_DELAY", "4")
+os.environ.setdefault("LLM_REQUEST_TIMEOUT", "45")
+
+logging.basicConfig(level=logging.INFO)
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -31,7 +39,84 @@ from score import main as run_scoring
 
 app = FastAPI(title="Resume Reality Check")
 
+log = logging.getLogger("rrc")
+
 DEFAULT_ROLE = "software_engineering_intern"
+
+# Loggers the scoring pipeline writes to. We tap these during a request so a
+# swallowed LLM/network error can be surfaced to the caller instead of
+# collapsing into a generic "couldn't read the PDF".
+_PIPELINE_LOGGERS = ("pdf", "evaluator", "llm_utils", "score", "github", "transform")
+
+
+def _llm_config_problem() -> str | None:
+    """Human-readable reason the configured model can't run here, or None if OK.
+
+    Catches the two failure modes that otherwise show up as a misleading 422:
+    a missing API key, and a DEFAULT_MODEL that points at a local Ollama server
+    which does not exist on Vercel.
+    """
+    try:
+        from config import DEFAULT_MODEL, provider_for
+    except Exception as exc:  # import-time misconfig
+        return f"Config failed to load: {type(exc).__name__}: {exc}"
+
+    try:
+        cfg = provider_for(DEFAULT_MODEL)
+    except Exception as exc:
+        return (
+            f"Model '{DEFAULT_MODEL}' is not usable: {exc} "
+            "Set DEFAULT_MODEL=gemini-2.5-flash and add GEMINI_API_KEY in your "
+            "Vercel project's Environment Variables, then redeploy."
+        )
+
+    base = cfg.get("base_url", "") or ""
+    if "localhost" in base or "127.0.0.1" in base:
+        return (
+            f"DEFAULT_MODEL is '{DEFAULT_MODEL}', which talks to a local server "
+            f"({base}). That server does not exist on Vercel. Set "
+            "DEFAULT_MODEL=gemini-2.5-flash and add GEMINI_API_KEY, then redeploy."
+        )
+    # provider_for() already raises if a required api key env var is unset, so
+    # reaching here with a remote base_url means the provider is configured.
+    return None
+
+
+class _RecordCollector(logging.Handler):
+    def __init__(self):
+        super().__init__(level=logging.WARNING)
+        self.lines: list[str] = []
+
+    def emit(self, record):
+        try:
+            self.lines.append(f"{record.name}: {record.getMessage()}")
+        except Exception:
+            pass
+
+
+def _score_with_diagnostics(pdf_path, role_obj):
+    """Run score.main, returning (evaluation, warning_lines)."""
+    collector = _RecordCollector()
+    tapped = [logging.getLogger(name) for name in _PIPELINE_LOGGERS]
+    for lg in tapped:
+        lg.addHandler(collector)
+    try:
+        return run_scoring(pdf_path, role_obj), collector.lines
+    finally:
+        for lg in tapped:
+            lg.removeHandler(collector)
+
+
+try:
+    _startup_problem = _llm_config_problem()
+    from config import DEFAULT_MODEL as _dm
+
+    if _startup_problem:
+        log.warning("Resume Reality Check: model=%s -> %s", _dm, _startup_problem)
+    else:
+        log.info("Resume Reality Check: model=%s, LLM config OK", _dm)
+except Exception:  # never let diagnostics break import
+    log.exception("startup diagnostics failed")
 
 
 def _roles():
@@ -106,7 +191,28 @@ def _summarise(evaluation, role) -> dict:
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    """Liveness + LLM-config check. Hit this first when a deploy misbehaves."""
+    from config import DEFAULT_MODEL
+
+    problem = _llm_config_problem()
+    base_url = None
+    try:
+        from config import provider_for
+
+        base_url = provider_for(DEFAULT_MODEL).get("base_url")
+    except Exception:
+        pass
+
+    return {
+        "status": "ok" if problem is None else "misconfigured",
+        "model": DEFAULT_MODEL,
+        "provider_base_url": base_url,
+        "llm_ready": problem is None,
+        "detail": problem,
+        "development_mode": os.getenv("DEVELOPMENT_MODE"),
+        "github_enrichment": os.getenv("ENABLE_GITHUB_ENRICHMENT"),
+        "roles": _roles(),
+    }
 
 
 @app.get("/roles")
@@ -142,20 +248,32 @@ async def score_endpoint(
     data = await resume.read()
     if not data:
         raise HTTPException(400, "The uploaded file is empty.")
-    if not data[:5].startswith(b"%PDF"):
+    if b"%PDF" not in data[:1024]:
         raise HTTPException(400, "That doesn't look like a PDF file.")
     if len(data) > 12 * 1024 * 1024:
         raise HTTPException(413, "PDF is larger than 12 MB.")
+
+    # Fail fast with a clear message if the model/key isn't set up, instead of
+    # letting the pipeline swallow the error and return a misleading 422.
+    problem = _llm_config_problem()
+    if problem:
+        log.error("LLM not configured: %s", problem)
+        raise HTTPException(503, problem)
 
     fd, tmp_path = tempfile.mkstemp(suffix=".pdf")
     try:
         with os.fdopen(fd, "wb") as fh:
             fh.write(data)
 
-        evaluation = run_scoring(tmp_path, role_obj)
+        evaluation, warnings = _score_with_diagnostics(tmp_path, role_obj)
         if evaluation is None:
+            tail = " | ".join(warnings[-5:]) if warnings else "no diagnostic output"
+            log.error("Scoring returned None. Pipeline warnings: %s", tail)
             raise HTTPException(
-                422, "Couldn't read enough from that PDF to score it."
+                422,
+                "Couldn't extract a resume from that PDF. "
+                "This is usually a scanned/image-only PDF or an LLM call "
+                f"failing. Pipeline reported: {tail}",
             )
 
         return JSONResponse(
@@ -169,6 +287,7 @@ async def score_endpoint(
     except HTTPException:
         raise
     except Exception as exc:  # surface the failure instead of a bare 500
+        log.exception("Unexpected error scoring resume")
         raise HTTPException(500, f"{type(exc).__name__}: {exc}")
     finally:
         try:
