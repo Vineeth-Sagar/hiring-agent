@@ -378,7 +378,13 @@ class OpenAICompatibleProvider:
                 time.sleep(sleep_time)
                 continue
 
-            response.raise_for_status()
+            if response.status_code >= 400:
+                detail = (response.text or "").strip().replace("\n", " ")
+                raise requests.HTTPError(
+                    f"{response.status_code} {response.reason} from {url} :: "
+                    f"{detail[:800]}",
+                    response=response,
+                )
             data = response.json()
             try:
                 content = data["choices"][0]["message"]["content"]

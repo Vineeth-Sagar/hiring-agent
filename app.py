@@ -23,10 +23,12 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 # project module is imported. Real dashboard env vars still win (setdefault).
 os.environ.setdefault("DEVELOPMENT_MODE", "false")
 os.environ.setdefault("ENABLE_GITHUB_ENRICHMENT", "false")
-# Serverless has a hard request budget (Vercel: 60s). Fail fast on rate limits
-# rather than getting killed mid-backoff. Override in the dashboard if needed.
-os.environ.setdefault("LLM_MAX_RETRIES", "2")
-os.environ.setdefault("LLM_RETRY_BASE_DELAY", "4")
+# Serverless has a hard request budget (Vercel: 60s). Keep retries modest so a
+# transient 503/429 gets a couple of quick attempts without blowing the budget.
+# Override in the dashboard if needed.
+os.environ.setdefault("LLM_MAX_RETRIES", "3")
+os.environ.setdefault("LLM_RETRY_BASE_DELAY", "2")
+os.environ.setdefault("LLM_RETRY_MAX_DELAY", "8")
 os.environ.setdefault("LLM_REQUEST_TIMEOUT", "45")
 
 logging.basicConfig(level=logging.INFO)
@@ -221,6 +223,81 @@ def roles():
         "roles": [{"value": r, "label": _pretty_role(r)} for r in _roles()],
         "default": _default_role(),
     }
+
+
+@app.get("/selftest")
+def selftest():
+    """Talk to the configured LLM provider directly and report exactly what it says.
+
+    Lists the models the API key can actually see, then makes one tiny chat call
+    with the configured model. No secrets are returned.
+    """
+    import requests
+
+    from config import DEFAULT_MODEL, provider_for
+
+    out = {"model": DEFAULT_MODEL}
+    try:
+        cfg = provider_for(DEFAULT_MODEL)
+    except Exception as exc:
+        return {**out, "ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+    base = (cfg.get("base_url") or "").rstrip("/")
+    key = cfg.get("api_key")
+    headers = {"Content-Type": "application/json"}
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    out["provider_base_url"] = base
+    out["api_key_present"] = bool(key)
+
+    # 1) which models can this key list?
+    try:
+        r = requests.get(f"{base}/models", headers=headers, timeout=20)
+        out["models_endpoint_status"] = r.status_code
+        if r.ok:
+            body = r.json()
+            ids = sorted(
+                m.get("id") or m.get("name", "")
+                for m in (body.get("data") or body.get("models") or [])
+            )
+            out["available_models"] = [m for m in ids if m]
+        else:
+            out["models_endpoint_body"] = r.text[:500]
+    except Exception as exc:
+        out["models_endpoint_error"] = f"{type(exc).__name__}: {exc}"
+
+    # 2) can we actually complete a chat with the configured model?
+    try:
+        r = requests.post(
+            f"{base}/chat/completions",
+            headers=headers,
+            json={
+                "model": DEFAULT_MODEL,
+                "messages": [{"role": "user", "content": "ping"}],
+                "max_tokens": 5,
+            },
+            timeout=30,
+        )
+        out["chat_status"] = r.status_code
+        out["chat_ok"] = r.ok
+        if not r.ok:
+            out["chat_body"] = r.text[:800]
+        else:
+            out["chat_sample"] = r.json().get("choices", [{}])[0].get("message", {})
+    except Exception as exc:
+        out["chat_error"] = f"{type(exc).__name__}: {exc}"
+
+    out["ok"] = bool(out.get("chat_ok"))
+    if not out["ok"] and out.get("available_models"):
+        flash = [
+            m for m in out["available_models"]
+            if "flash" in m and "image" not in m and "embedding" not in m
+        ]
+        out["hint"] = (
+            "Set DEFAULT_MODEL to one of the available models above and redeploy"
+            + (f" (e.g. {flash[0].split('/')[-1]})" if flash else "")
+        )
+    return out
 
 
 @app.get("/", response_class=HTMLResponse)
