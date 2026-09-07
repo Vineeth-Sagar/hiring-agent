@@ -37,7 +37,7 @@ from transform import (
     convert_github_data_to_text,
     convert_blog_data_to_text,
 )
-from config import DEVELOPMENT_MODE
+from config import DEVELOPMENT_MODE, ENABLE_GITHUB_ENRICHMENT
 
 logger = logging.getLogger(__name__)
 
@@ -288,7 +288,7 @@ def main(pdf_path, role: Role):
                     f"Failed to delete invalid GitHub cache file {github_cache_filename}: {delete_err}"
                 )
 
-    if not github_cache_loaded:
+    if ENABLE_GITHUB_ENRICHMENT and not github_cache_loaded:
         # Add validation to handle None values
         profiles = []
         if resume_data and hasattr(resume_data, "basics") and resume_data.basics:

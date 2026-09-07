@@ -1,0 +1,12 @@
+# Keep the deployment bundle small and under Vercel's size limit.
+# roles/, prompts/, providers.json are required at runtime — do NOT ignore them.
+.git
+docs
+resume
+cache
+*.csv
+tests
+.env
+.env.*
+!.env.example
+requirements-dev.txt

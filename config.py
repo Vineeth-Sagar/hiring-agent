@@ -6,12 +6,23 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-# Global development mode flag. Preserved here because score.py and github.py
-# import it from this module.
-DEVELOPMENT_MODE = True
-
 # Load .env before any os.getenv below, so values apply regardless of import order.
 load_dotenv(Path(__file__).parent / ".env")
+
+
+def _env_flag(name: str, default: str) -> bool:
+    return os.getenv(name, default).strip().lower() in ("1", "true", "yes", "on")
+
+
+# Global development mode flag. Preserved here because score.py and github.py
+# import it from this module. Defaults to True for local CLI use (caches parsed
+# resumes / GitHub data and appends a CSV row). Set DEVELOPMENT_MODE=false on
+# read-only or serverless hosts such as Vercel, where those writes would fail.
+DEVELOPMENT_MODE = _env_flag("DEVELOPMENT_MODE", "true")
+
+# When false, score.py skips the automatic GitHub profile enrichment step. Handy
+# on platforms with short function timeouts or without a GITHUB_TOKEN.
+ENABLE_GITHUB_ENRICHMENT = _env_flag("ENABLE_GITHUB_ENRICHMENT", "true")
 
 _CONFIG_PATH = Path(__file__).parent / "providers.json"
 
