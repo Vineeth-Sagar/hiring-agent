@@ -237,8 +237,8 @@ PAGE = r"""<!doctype html>
     letter-spacing: .01em; margin-bottom: 18px;
   }
   h1 {
-    text-align: center; font-size: clamp(30px, 6vw, 52px); line-height: 1.08;
-    letter-spacing: -0.02em; margin: 0 auto 18px; max-width: 12ch; font-weight: 800;
+    text-align: center; font-size: clamp(28px, 5.4vw, 46px); line-height: 1.1;
+    letter-spacing: -0.02em; margin: 0 auto 18px; max-width: 17ch; font-weight: 800;
   }
   h1 em { color: var(--green); font-style: normal; }
   .lede {
